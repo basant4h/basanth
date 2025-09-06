@@ -1,0 +1,276 @@
+#!/bin/bash
+# -----------------------------------------------------------------------------
+# COMPLETE SCRIPT FOR EPIGENOMICS ANALYSIS (TASKS 4 & 5 CONSOLIDATED)
+# -----------------------------------------------------------------------------
+# This script automates the entire workflow, from ATAC-seq peak identification
+# to the analysis of candidate distal regulatory elements.
+#
+# --- WORKFLOW ---
+# TASK 4: ATAC-seq Analysis
+#   - Downloads ATAC-seq data for stomach and sigmoid colon.
+#   - Prepares gene annotation files from a raw GTF.
+#   - Uses BEDTools to identify peaks in promoters AND intergenic peaks.
+#
+# TASK 5: Distal Regulatory Element Analysis
+#   - Downloads H3K27ac and H3K4me1 ChIP-seq data for the same tissues.
+#   - Intersects intergenic ATAC-seq peaks with both histone marks to find
+#     candidate active distal regulatory elements.
+#   - Filters these elements for chromosome 1.
+#   - Calculates the distance from each regulatory element to the nearest
+#     protein-coding gene on chromosome 1.
+#   - Reports the mean and median of these distances for each tissue.
+#
+# USAGE:
+# 1. Clone the project: git clone https://github.com/bborsari/epigenomics_uvic
+# 2. Navigate into the project folder: cd epigenomics_uvic
+# 3. Place this script inside the 'epigenomics_uvic' directory.
+# 4. Make it executable: chmod +x run_complete_epigenomics_analysis.sh
+# 5. Run it: ./run_complete_epigenomics_analysis.sh
+# -----------------------------------------------------------------------------
+
+# Exit immediately if any command fails to prevent errors and partial results.
+set -e
+
+echo "### STARTING COMPLETE EPIGENOMICS ANALYSIS (TASKS 4 & 5) ###"
+
+# --- Setup: Navigate into the ATAC-seq directory ---
+echo "--> Navigating into ATAC-seq directory..."
+mkdir -p ATAC-seq
+cd ATAC-seq
+
+# =============================================================================
+# TASK 4: ATAC-SEQ PRE-PROCESSING & INTERSECTION ANALYSIS
+# =============================================================================
+echo
+echo "###--- TASK 4: ATAC-seq Peak Analysis ---###"
+
+# --- Step 4.1: Setup Directories & Download ATAC-seq Data ---
+echo "--> Step 4.1: Setting up directories and downloading ATAC-seq data..."
+mkdir -p 00_metadata 01_data/atac_peaks_bigbed 01_data/atac_peaks_bed 02_analysis/intermediate_files annotation
+../bin/download.metadata.sh "https://www.encodeproject.org/metadata/?replicates.library.biosample.donor.uuid=d370683e-81e7-473f-8475-7716d027849b&status=released&status=submitted&status=in+progress&biosample_ontology.term_name=sigmoid+colon&biosample_ontology.term_name=stomach&assay_slims=DNA+accessibility&type=Experiment"
+mv metadata.tsv 00_metadata/atac_metadata.tsv
+
+grep -F ATAC-seq 00_metadata/atac_metadata.tsv |\
+grep -F "bigBed_narrowPeak" |\
+grep -F "pseudoreplicated_peaks" |\
+grep -F "GRCh38" |\
+awk 'BEGIN{FS=OFS="\t"}{print $1, $11, $23}' |\
+sort -k2,2 -k1,1r |\
+sort -k2,2 -u > 02_analysis/intermediate_files/atac.peaks.ids.txt
+
+cut -f1 02_analysis/intermediate_files/atac.peaks.ids.txt |\
+while read filename; do
+wget -nc -P 01_data/atac_peaks_bigbed "https://www.encodeproject.org/files/$filename/@@download/$filename.bigBed"
+done
+
+# --- Step 4.2: Prepare Annotation and Peak Files ---
+echo "--> Step 4.2: Preparing annotation and peak files..."
+wget -nc -P annotation/ https://public-docs.crg.es/rguigo/Data/bborsari/UVIC/epigenomics_course/gencode.v24.protein.coding.non.redundant.TSS.bed
+wget -nc -P annotation/ https://www.encodeproject.org/files/gencode.v24.primary_assembly.annotation/@@download/gencode.v24.primary_assembly.annotation.gtf.gz
+gunzip -f annotation/gencode.v24.primary_assembly.annotation.gtf.gz
+awk '$3=="gene"' annotation/gencode.v24.primary_assembly.annotation.gtf | \
+grep -F "protein_coding" | \
+cut -d ";" -f1 | \
+awk 'BEGIN{OFS="\t"}{print $1, $4, $5, $10, 0, $7, $10}' | \
+sed 's/"//g' | \
+awk 'BEGIN{FS=OFS="\t"}$1!="chrM"{$2=($2-1); print $0}' > annotation/gencode.v24.protein.coding.gene.body.bed
+
+cut -f1 02_analysis/intermediate_files/atac.peaks.ids.txt |\
+while read filename; do
+  bigBedToBed 01_data/atac_peaks_bigbed/"$filename".bigBed 01_data/atac_peaks_bed/"$filename".bed
+done
+
+# --- Step 4.3: Intersection Analysis ---
+echo "--> Step 4.3: Running intersection analysis..."
+mkdir -p 02_analysis/peaks_analysis
+
+echo "   Finding peaks in promoter regions..."
+cut -f-2 02_analysis/intermediate_files/atac.peaks.ids.txt | \
+while read filename tissue; do
+  clean_tissue=$(echo "$tissue" | tr ' ' '_')
+  bedtools intersect \
+    -a annotation/gencode.v24.protein.coding.non.redundant.TSS.bed \
+    -b 01_data/atac_peaks_bed/"$filename".bed -u | \
+  cut -f7 | \
+  sort -u > 02_analysis/peaks_analysis/genes.with.promoter.peaks."$clean_tissue".txt
+done
+
+echo "   Identifying intergenic ATAC-seq peaks..."
+cut -f-2 02_analysis/intermediate_files/atac.peaks.ids.txt |\
+while read filename tissue; do
+  clean_tissue=$(echo "$tissue" | tr ' ' '_')
+  bedtools intersect \
+    -a 01_data/atac_peaks_bed/"$filename".bed \
+    -b annotation/gencode.v24.protein.coding.gene.body.bed -v \
+    > 02_analysis/peaks_analysis/peaks.outside.genes."$clean_tissue".bed
+done
+echo "Intersection analysis complete."
+
+# --- Step 4.4: Report Peak Counts ---
+echo "--> Step 4.4: Reporting ATAC-seq peak counts from Task 4..."
+for tissue in stomach sigmoid_colon; do
+    echo "Results for tissue: $tissue"
+    echo "  - Promoters with ATAC-seq peaks (Expected: ~15029 for stomach, ~14830 for sigmoid_colon):"
+    wc -l "02_analysis/peaks_analysis/genes.with.promoter.peaks.${tissue}.txt"
+    echo "  - Intergenic ATAC-seq peaks found (Expected: ~34537 for stomach, ~37035 for sigmoid_colon):"
+    wc -l "02_analysis/peaks_analysis/peaks.outside.genes.${tissue}.bed"
+done
+echo "------------------------------------------------------"
+
+# --- Navigate back to the main project directory before starting Task 5 ---
+cd ..
+
+# =============================================================================
+# TASK 5: DISTAL REGULATORY ELEMENT ANALYSIS
+# =============================================================================
+echo
+echo "###--- TASK 5: Distal Regulatory Element Analysis ---###"
+
+# --- Step 5.1: Create directory for Task 5 and enter it ---
+echo "--> Step 5.1: Creating directory for regulatory analysis..."
+mkdir -p 03_regulatory_analysis
+cd 03_regulatory_analysis
+
+# --- Step 5.2: Download Histone Mark Data & Identify Candidates ---
+echo "--> Step 5.2: Downloading histone mark data and identifying candidate elements..."
+mkdir -p 00_metadata 01_data/histone_bigbed 01_data/histone_bed/h3k27ac 01_data/histone_bed/h3k4me1 02_analysis/intermediate_files
+
+../bin/download.metadata.sh "https://www.encodeproject.org/metadata/?replicates.library.biosample.donor.uuid=d370683e-81e7-473f-8475-7716d027849b&status=released&status=submitted&status=in+progress&assay_title=Histone+ChIP-seq&target.label=H3K27ac&target.label=H3K4me1&biosample_ontology.term_name=sigmoid+colon&biosample_ontology.term_name=stomach&type=Experiment"
+mv metadata.tsv 00_metadata/histone_metadata.tsv
+
+grep -F H3K27ac 00_metadata/histone_metadata.tsv | grep -F "bigBed_narrowPeak" | grep -F "pseudoreplicated_peaks" | grep -F "GRCh38" | awk 'BEGIN{FS=OFS="\t"}{print $1, $11, $23}' | sort -k2,2 -k1,1r | sort -k2,2 -u > 02_analysis/intermediate_files/bigBed.peaks.ids.h3k27ac.txt
+cut -f1 02_analysis/intermediate_files/bigBed.peaks.ids.h3k27ac.txt | while read filename; do
+  wget -nc -P 01_data/histone_bigbed "https://www.encodeproject.org/files/$filename/@@download/$filename.bigBed"
+  bigBedToBed 01_data/histone_bigbed/"$filename".bigBed 01_data/histone_bed/h3k27ac/"$filename".bed
+done
+
+grep -F H3K4me1 00_metadata/histone_metadata.tsv | grep -F "bigBed_narrowPeak" | grep -F "pseudoreplicated_peaks" | grep -F "GRCh38" | awk 'BEGIN{FS=OFS="\t"}{print $1, $11, $23}' | sort -k2,2 -k1,1r | sort -k2,2 -u > 02_analysis/intermediate_files/bigBed.peaks.ids.h3k4me1.txt
+cut -f1 02_analysis/intermediate_files/bigBed.peaks.ids.h3k4me1.txt | while read filename; do
+  wget -nc -P 01_data/histone_bigbed "https://www.encodeproject.org/files/$filename/@@download/$filename.bigBed"
+  bigBedToBed 01_data/histone_bigbed/"$filename".bigBed 01_data/histone_bed/h3k4me1/"$filename".bed
+done
+
+while read -r H3K27AC_FILE_ID TISSUE_NAME_RAW H3K27AC_MARK; do
+  tissue=$(echo "$TISSUE_NAME_RAW" | tr ' ' '_')
+  echo "Analyzing tissue: $tissue"
+  H3K4ME1_FILE_ID=$(awk -v tissue="$TISSUE_NAME_RAW" 'BEGIN{FS="\t"} $2 == tissue {print $1}' 02_analysis/intermediate_files/bigBed.peaks.ids.h3k4me1.txt)
+  if [ -z "$H3K27AC_FILE_ID" ] || [ -z "$H3K4ME1_FILE_ID" ]; then
+    echo "Warning: Could not find matching histone peak files for tissue '$TISSUE_NAME_RAW'. Skipping."
+    continue
+  fi
+  ATAC_PEAKS_FILE="../ATAC-seq/02_analysis/peaks_analysis/peaks.outside.genes.${tissue}.bed"
+  H3K27AC_BED_FILE="01_data/histone_bed/h3k27ac/${H3K27AC_FILE_ID}.bed"
+  H3K4ME1_BED_FILE="01_data/histone_bed/h3k4me1/${H3K4ME1_FILE_ID}.bed"
+  CANDIDATE_ELEMENTS_FILE="02_analysis/candidate.regulatory.elements.${tissue}.bed"
+  bedtools intersect -a "$ATAC_PEAKS_FILE" -b "$H3K27AC_BED_FILE" -u | bedtools intersect -a - -b "$H3K4ME1_BED_FILE" -u > "$CANDIDATE_ELEMENTS_FILE"
+  echo "Candidate distal regulatory elements (Expected: ~8022 for stomach, ~14215 for sigmoid_colon):"
+  wc -l "$CANDIDATE_ELEMENTS_FILE"
+  
+  # --- Step 5.3: Filter for Chromosome 1 ---
+  echo "--> Step 5.3: Filtering for chr1 elements..."
+  CHR1_STARTS_FILE="02_analysis/regulatory.elements.starts.${tissue}.tsv"
+  awk '$1 == "chr1" {print $4"\t"$2}' "$CANDIDATE_ELEMENTS_FILE" > "$CHR1_STARTS_FILE"
+  echo "Created ${CHR1_STARTS_FILE} with $(wc -l < "$CHR1_STARTS_FILE") elements. (Expected: ~987 for stomach, ~1521 for sigmoid_colon)"
+  echo "------------------------------------------------------"
+done < <(tr -d '\r' < 02_analysis/intermediate_files/bigBed.peaks.ids.h3k27ac.txt)
+
+# --- Step 5.4: Extract Gene Starts on Chromosome 1 ---
+echo "--> Step 5.4: Extracting protein-coding gene starts on chr1..."
+awk '$1 == "chr1"' ../ATAC-seq/annotation/gencode.v24.protein.coding.gene.body.bed | \
+awk 'BEGIN{FS=OFS="\t"} {if ($6=="+"){start=$2} else {start=$3}; print $4, start}' \
+> 01_data/gene.starts.chr1.tsv
+echo "Created 01_data/gene.starts.chr1.tsv with $(wc -l < 01_data/gene.starts.chr1.tsv) genes. (Expected: ~2047)"
+echo "------------------------------------------------------"
+
+# --- Step 5.5: Create Python Script ---
+echo "--> Step 5.5: Creating Python script for distance calculation..."
+cat <<EOF > ../bin/get.distance.py
+#!/usr/bin/env python
+from __future__ import print_function
+import sys
+from optparse import OptionParser
+parser = OptionParser()
+parser.add_option("-i", "--input", dest="input")
+parser.add_option("-s", "--start", dest="start")
+options, args = parser.parse_args()
+try:
+    with open(options.input) as f:
+        lines = f.readlines()
+    enhancer_start = int(options.start)
+except Exception as e:
+    sys.exit("Error: Could not process inputs. Details: %s" % e)
+min_distance = -1
+closest_gene = ""
+closest_gene_start = 0
+for line in lines:
+    try:
+        gene, gene_start_str = line.strip().split('\t')
+        gene_start = int(gene_start_str)
+        distance = abs(gene_start - enhancer_start)
+        if min_distance == -1 or distance < min_distance:
+            min_distance = distance
+            closest_gene = gene
+            closest_gene_start = gene_start
+    except ValueError:
+        continue
+if closest_gene:
+    print("\t".join([closest_gene, str(closest_gene_start), str(min_distance)]))
+EOF
+chmod +x ../bin/get.distance.py
+echo "Running test case: python2 ../bin/get.distance.py --input 01_data/gene.starts.chr1.tsv --start 980000"
+echo "# Expected test output: ENSG00000187642.9   982093  2093"
+python2 ../bin/get.distance.py --input 01_data/gene.starts.chr1.tsv --start 980000
+echo "------------------------------------------------------"
+
+# --- Step 5.6: Calculate All Distances ---
+echo "--> Step 5.6: Calculating distances for all chr1 regulatory elements..."
+for tissue in stomach sigmoid_colon; do
+  echo "Processing regulatory elements for $tissue..."
+  REG_ELEMENTS_FILE="02_analysis/regulatory.elements.starts.${tissue}.tsv"
+  OUTPUT_DISTANCES_FILE="02_analysis/regulatory.elements.distances.${tissue}.tsv"
+  > "$OUTPUT_DISTANCES_FILE"
+  cat "$REG_ELEMENTS_FILE" | while read -r element start; do
+    python2 ../bin/get.distance.py --input 01_data/gene.starts.chr1.tsv --start "$start" | \
+    awk -v el="$element" 'BEGIN{OFS="\t"} {print el, $0}' >> "$OUTPUT_DISTANCES_FILE"
+  done
+  echo "Created ${OUTPUT_DISTANCES_FILE} with distances for $(wc -l < "$OUTPUT_DISTANCES_FILE") elements."
+  echo "------------------------------------------------------"
+done
+
+# --- Step 5.7: Calculate Statistics with R ---
+echo "--> Step 5.7: Creating R script and calculating distance statistics..."
+cat <<'EOF' > ../bin/calculate_stats.R
+#!/usr/bin/env Rscript
+library(optparse)
+option_list = list(make_option(c("-i", "--input"), type="character", default=NULL, help="Path to distances file", metavar="character")); 
+parser = OptionParser(option_list=option_list);
+arguments = parse_args(parser);
+if (is.null(arguments$input)){
+  print_help(parser)
+  stop("Error: An input file must be supplied.", call.=FALSE)
+}
+input_file <- arguments$input
+if (file.exists(input_file) && file.info(input_file)$size > 0) {
+  data <- read.table(input_file, sep="\t", header=FALSE)
+  distances <- data$V4
+  mean_val <- mean(distances, na.rm = TRUE)
+  median_val <- median(distances, na.rm = TRUE)
+  cat("  Mean distance:  \t", mean_val, "\n")
+  cat("  Median distance:\t", median_val, "\n")
+} else {
+  cat("  Distance file is empty or not found.\n")
+}
+EOF
+chmod +x ../bin/calculate_stats.R
+
+for tissue in stomach sigmoid_colon; do
+  echo "Statistics for $tissue:"
+  echo "# Expected for stomach:   Mean ~27550, Median ~10226"
+  echo "# Expected for sigmoid_colon: Mean ~40714, Median ~12714"
+  DISTANCES_FILE="02_analysis/regulatory.elements.distances.${tissue}.tsv"
+  Rscript ../bin/calculate_stats.R --input "$DISTANCES_FILE"
+  echo "------------------------------------------------------"
+done
+
+echo "### COMPLETE ANALYSIS FINISHED SUCCESSFULLY ###"
+
